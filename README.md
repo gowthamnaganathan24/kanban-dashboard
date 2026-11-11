@@ -71,3 +71,5 @@ export default defineConfig([
   },
 ])
 ```
+
+CI/CD webhook automation tested.
