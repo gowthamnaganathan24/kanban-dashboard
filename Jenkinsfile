@@ -10,7 +10,7 @@ pipeline {
     environment {
         IMAGE_NAME = 'gowthamdocker24/kanban-dashboard'
         APP_NAME = 'kanban-app'
-        APP_URL = 'http://localhost:8081/health'
+        APP_URL = 'http://localhost:8081/rollback-test-invalid'
     }
 
     stages {
