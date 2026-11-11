@@ -10,6 +10,7 @@ pipeline {
     environment {
         IMAGE_NAME = 'gowthamdocker24/kanban-dashboard'
         APP_NAME = 'kanban-app'
+        APP_URL = 'http://localhost:8081/health'
     }
 
     stages {
@@ -26,9 +27,7 @@ pipeline {
                 }
 
                 sh '''
-                    docker build \
-                      -t "$IMAGE_NAME:$IMAGE_TAG" \
-                      .
+                    docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
                 '''
             }
         }
@@ -44,20 +43,81 @@ pipeline {
                 ]) {
                     sh '''
                         set +x
-                        echo "$DOCKER_TOKEN" | docker login \
-                          -u "$DOCKER_USER" \
-                          --password-stdin
+
+                        export DOCKER_CONFIG="$(mktemp -d)"
+                        trap 'docker logout >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
+
+                        printf '%s' "$DOCKER_TOKEN" |
+                          docker login -u "$DOCKER_USER" --password-stdin
 
                         docker push "$IMAGE_NAME:$IMAGE_TAG"
-                        docker logout
                     '''
                 }
             }
         }
 
-        stage('Deploy to EC2') {
+        stage('Deploy and Verify') {
             steps {
                 sh '''
+                    set -eu
+
+                    PREVIOUS_IMAGE=""
+                    if docker container inspect "$APP_NAME" >/dev/null 2>&1; then
+                        PREVIOUS_IMAGE=$(docker inspect \
+                          --format '{{.Config.Image}}' "$APP_NAME")
+                    fi
+
+                    echo "Previous image: ${PREVIOUS_IMAGE:-none}"
+                    echo "New image: $IMAGE_NAME:$IMAGE_TAG"
+
+                    rollback() {
+                        echo "Deployment failed. Starting rollback..."
+
+                        docker rm -f "$APP_NAME" 2>/dev/null || true
+
+                        if [ -n "$PREVIOUS_IMAGE" ]; then
+                            docker run -d \
+                              --name "$APP_NAME" \
+                              --restart unless-stopped \
+                              -p 8081:8080 \
+                              --memory=512m \
+                              --cpus=1 \
+                              "$PREVIOUS_IMAGE"
+
+                            echo "Restored image: $PREVIOUS_IMAGE"
+
+                            if check_health; then
+                                echo "Rollback health check PASSED"
+                            else
+                                echo "WARNING: Rollback health check FAILED"
+                            fi
+                        else
+                            echo "No previous image available for rollback"
+                        fi
+                    }
+
+                    check_health() {
+                        i=1
+                        while [ "$i" -le 12 ]; do
+                            STATUS=$(docker inspect \
+                              --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                              "$APP_NAME" 2>/dev/null || true)
+
+                            if [ "$STATUS" = "healthy" ] &&
+                               curl -fsS "$APP_URL" >/dev/null; then
+                                return 0
+                            fi
+
+                            echo "Health check $i/12: $STATUS"
+                            sleep 5
+                            i=$((i + 1))
+                        done
+
+                        return 1
+                    }
+
+                    trap 'rollback' EXIT
+
                     docker rm -f "$APP_NAME" 2>/dev/null || true
 
                     docker run -d \
@@ -67,25 +127,14 @@ pipeline {
                       --memory=512m \
                       --cpus=1 \
                       "$IMAGE_NAME:$IMAGE_TAG"
-                '''
-            }
-        }
 
-        stage('Health Check') {
-            steps {
-                sh '''
-                    for i in $(seq 1 12); do
-                        if curl -fsS http://localhost:8081/health; then
-                            echo "Application health check passed"
-                            exit 0
-                        fi
+                    if ! check_health; then
+                        echo "New deployment health check FAILED"
+                        exit 1
+                    fi
 
-                        echo "Waiting for application..."
-                        sleep 5
-                    done
-
-                    echo "Application health check failed"
-                    exit 1
+                    trap - EXIT
+                    echo "New deployment health check PASSED"
                 '''
             }
         }
@@ -93,11 +142,11 @@ pipeline {
 
     post {
         success {
-            echo 'CI/CD pipeline completed successfully!'
+            echo 'SUCCESS: Deployment completed successfully.'
         }
 
         failure {
-            echo 'CI/CD pipeline failed. Check the console output.'
+            echo 'FAILURE: Check deployment and rollback logs.'
         }
     }
 }
